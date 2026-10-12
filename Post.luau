@@ -118,6 +118,48 @@ local function peephole(list)
 end
 
 ---------------------------------------------------------------------------------------------------
+-- tail returns
+---------------------------------------------------------------------------------------------------
+
+local function endsWithBareReturn(list)
+	local last = list[#list]
+	return last ~= nil and last.t == "return" and #last.values == 0
+end
+
+-- `list` sits at the very end of the function: a bare `return` there is redundant, and
+-- `if c then A return end <rest>` can become `if c then A else <rest> end`.
+local function tailify(list)
+	for i = 1, #list - 1 do
+		local S = list[i]
+		if S.t == "if" and not S.el and endsWithBareReturn(S.th) and #S.th > 1 and (#list - i) <= 6 then
+			local rest = {}
+			for j = i + 1, #list do
+				rest[#rest + 1] = list[j]
+				list[j] = nil
+			end
+			S.th[#S.th] = nil
+			S.el = rest
+			tailify(S.th)
+			tailify(S.el)
+			return
+		end
+	end
+	local last = list[#list]
+	if not last then
+		return
+	end
+	if last.t == "return" and #last.values == 0 then
+		list[#list] = nil
+		tailify(list)
+	elseif last.t == "if" then
+		tailify(last.th)
+		if last.el then
+			tailify(last.el)
+		end
+	end
+end
+
+---------------------------------------------------------------------------------------------------
 -- declarations
 ---------------------------------------------------------------------------------------------------
 
@@ -192,7 +234,18 @@ end
 local function declareFunction(F, body)
 	local info = {}
 	local path = {}
+	for _, v in ipairs(F.vars) do
+		if v.kind == "for" then
+			v.reads = 0
+		end
+	end
 	local function note(v, isDef)
+		if v.owner == F and v.kind == "for" then
+			if not isDef then
+				v.reads = (v.reads or 0) + 1
+			end
+			return
+		end
 		if v.owner ~= F or v.kind ~= "local" then
 			return
 		end
@@ -216,9 +269,18 @@ local function declareFunction(F, body)
 	end
 	local function visitStmt(S)
 		if S.t == "assign" then
-			for _, tg in ipairs(S.targets) do
+			for k, tg in ipairs(S.targets) do
 				if tg.t == "var" then
 					note(tg.var, true)
+					-- remember the first real value: it names variables declared as `local x` / `= nil`
+					local v = tg.var
+					if v.owner == F and v.hintVal == nil then
+						local val = S.values[#S.values == 1 and 1 or k]
+						if val and val.t ~= "nil" then
+							v.hintVal = val
+							v.hintSlot = (#S.values == 1 and #S.targets > 1) and k or nil
+						end
+					end
 				end
 			end
 		end
@@ -361,9 +423,29 @@ local CHILD_METHODS = {
 	FindFirstAncestor = true, FindFirstAncestorOfClass = true, FindFirstAncestorWhichIsA = true,
 }
 
-local function hintFor(e, protoNames)
+local function isGenericName(n)
+	return n == nil or n:match("^v%d+$") or n:match("^p%d+") or n:match("^tbl%d*$") or n == "_" or n:match("^func%d*$")
+end
+
+local function hintFor(e, protoNames, slot)
 	if not e then
 		return nil
+	end
+	if e.t == "call" and e.fn.t == "global" and (e.fn.name == "pcall" or e.fn.name == "xpcall") and slot then
+		return slot == 1 and "success" or (slot == 2 and "result" or nil)
+	end
+	if e.t == "mcall" and (e.name == "Connect" or e.name == "Once" or e.name == "ConnectParallel") then
+		return "connection"
+	end
+	if e.t == "mcall" and e.name:match("^Get%u") and #e.args == 0 and e.name ~= "GetChildren" and e.name ~= "GetDescendants" then
+		return sanitize(lowerFirst(e.name:sub(4)))
+	end
+	if e.t == "call" and e.fn.t == "index" and e.fn.key.t == "str" and e.fn.key.v == "new" then
+		local o = e.fn.obj
+		local base = (o.t == "global" and o.name) or (o.t == "var" and o.var.name) or nil
+		if base and base ~= "Instance" and not isGenericName(base) then
+			return sanitize(lowerFirst(base))
+		end
 	end
 	if e.t == "mcall" then
 		local a1 = e.args[1]
@@ -528,9 +610,12 @@ local function nameTree(root, protoNames)
 			local t = S.t
 			if t == "local" then
 				for k, v in ipairs(S.vars) do
-					local hint = (#S.vars == #S.values or k == 1) and hintFor(S.values[k], counter.protoNames) or nil
+					local hint = (#S.vars == #S.values or k == 1 or #S.values == 1) and hintFor(S.values[#S.values == 1 and 1 or k], counter.protoNames, #S.values == 1 and #S.vars > 1 and k or nil) or nil
 					if #S.vars > 1 and #S.values > 0 and (v.reads or 0) == 0 then
 						v.name = v.name or "_"
+					end
+					if hint == nil and v.hintVal then
+						hint = hintFor(v.hintVal, counter.protoNames, v.hintSlot)
 					end
 					declare(v, hint, counter)
 					if v.name == "_" then
@@ -551,7 +636,13 @@ local function nameTree(root, protoNames)
 						break
 					end
 				end
+				if (S.var.reads or 0) == 0 then
+					S.var.name = "_"
+				end
 				declare(S.var, chosen, counter)
+				if S.var.name == "_" then
+					scopes[#scopes]["_"] = nil
+				end
 				nameList(S.body, counter)
 				scopes[#scopes] = nil
 			elseif t == "forin" then
@@ -566,7 +657,13 @@ local function nameTree(root, protoNames)
 					elseif k == 2 then
 						base = "v"
 					end
+					if (v.reads or 0) == 0 and (k < #S.vars or #S.vars == 1) then
+						v.name = "_"
+					end
 					declare(v, base, counter)
+					if v.name == "_" then
+						scopes[#scopes]["_"] = nil
+					end
 				end
 				nameList(S.body, counter)
 				scopes[#scopes] = nil
@@ -613,6 +710,7 @@ function Post.structured(F, body)
 	peephole(body)
 	Simplify.astPass(F, body)
 	peephole(body)
+	tailify(body)
 end
 
 -- run once on the complete tree: declarations, then names

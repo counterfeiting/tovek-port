@@ -178,7 +178,16 @@ end
 
 local COMPARE_NEG = { ["=="] = "~=", ["~="] = "==", ["<"] = ">=", [">="] = "<", ["<="] = ">", [">"] = "<=" }
 
+local function simplifiesOnNegate(e)
+	return (e.t == "un" and e.op == "not") or (e.t == "bin" and COMPARE_NEG[e.op] ~= nil) or e.t == "bool"
+		or (e.t == "bin" and (e.op == "and" or e.op == "or") and (simplifiesOnNegate(e.l) or simplifiesOnNegate(e.r)))
+end
+
 function A.negate(e)
+	if e.t == "bin" and (e.op == "and" or e.op == "or") and simplifiesOnNegate(e) then
+		-- De Morgan: not (a or b) == not a and not b
+		return { t = "bin", op = (e.op == "and") and "or" or "and", l = A.negate(e.l), r = A.negate(e.r) }
+	end
 	if e.t == "un" and e.op == "not" then
 		return e.e
 	elseif e.t == "bin" and COMPARE_NEG[e.op] then

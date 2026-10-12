@@ -210,8 +210,19 @@ function Emitter:emit(b, stops, lc, skipStart)
 			b = nextb
 		else
 			local reuse = self.done[b]
-			if reuse and not isDup(b) then
-				fail("block revisited (pc " .. tostring(b.pc) .. ")")
+			if reuse then
+				-- a block reached from several branches: re-emit a copy while the budget lasts
+				local tk = b.term.k
+				local cost = #b.stmts + 1
+				if self.isHeader[b] or not (tk == "goto" or tk == "ret" or tk == "cond") then
+					fail("block revisited (pc " .. tostring(b.pc) .. ")")
+				end
+				if not isDup(b) then
+					if self.dupBudget < cost then
+						fail("block revisited (pc " .. tostring(b.pc) .. ")")
+					end
+					self.dupBudget = self.dupBudget - cost
+				end
 			end
 			self.done[b] = true
 			if reuse then
@@ -222,6 +233,9 @@ function Emitter:emit(b, stops, lc, skipStart)
 				append(out, b.stmts)
 			end
 			local t = b.term
+			if reuse and t.k == "cond" then
+				t = { k = "cond", cond = cloneNode(t.cond), t = t.t, f = t.f }
+			end
 			local k = t.k
 			if k == "goto" then
 				b = t.to
@@ -619,6 +633,7 @@ function Structure.run(F)
 		isHeader = isHeader,
 		entered = {},
 		done = {},
+		dupBudget = 60,
 	}, Emitter)
 	local body, endStop = em:emit(F.entry, {}, nil)
 	if endStop ~= nil then

@@ -152,7 +152,6 @@ local function decompile2(target, options)
 end
 
 env.decompile2 = decompile2
-env.decompile = decompile2
 env.Tovek = {
 	decompile = decompile2,
 	import = import,
